@@ -8,6 +8,7 @@ import statistics
 import time
 import torch
 from collections import deque
+import torch.distributed as dist
 from torch.utils.tensorboard import SummaryWriter as TensorboardSummaryWriter
 
 import rsl_rl
@@ -21,10 +22,22 @@ class OnPolicyRunner:
     """On-policy runner for training and evaluation."""
 
     def __init__(self, env: VecEnv, train_cfg, log_dir=None, device="cpu"):
+        self.device = device
+        self.distributed = False
+        # check for distributed multi-GPU training
+        self.world_size = int(os.getenv("WORLD_SIZE", "1"))  # Total number of processes
+        self.rank = int(os.getenv("RANK", "0"))  # Global rank of this process
+        self.local_rank = int(os.getenv("LOCAL_RANK", "0")) # local rank of the process 
+        # distributed multi-GPU training settings
+        if self.world_size > 1:
+            self.distributed = True
+            dist.init_process_group("nccl", rank=self.rank, world_size=self.world_size)
+            self.device = f"cuda:{self.local_rank}"
+            torch.cuda.set_device(self.local_rank)
+
         self.cfg = train_cfg
         self.alg_cfg = train_cfg["algorithm"]
         self.policy_cfg = train_cfg["policy"]
-        self.device = device
         self.env = env
         obs, extras = self.env.get_observations()
         num_obs = obs.shape[1]
@@ -150,23 +163,25 @@ class OnPolicyRunner:
             stop = time.time()
             learn_time = stop - start
             self.current_learning_iteration = it
-            if self.log_dir is not None:
-                self.log(locals())
-            if it % self.save_interval == 0:
-                self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
-            ep_infos.clear()
-            if it == start_iter:
-                # obtain all the diff files
-                git_file_paths = store_code_state(self.log_dir, self.git_status_repos)
-                # if possible store them to wandb
-                if self.logger_type in ["wandb", "neptune"] and git_file_paths:
-                    for path in git_file_paths:
-                        self.writer.save_file(path)
+            if self.rank == 0:
+                if self.log_dir is not None:
+                    self.log(locals())
+                if it % self.save_interval == 0:
+                    self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
+                ep_infos.clear()
+                if it == start_iter:
+                    # obtain all the diff files
+                    git_file_paths = store_code_state(self.log_dir, self.git_status_repos)
+                    # if possible store them to wandb
+                    if self.logger_type in ["wandb", "neptune"] and git_file_paths:
+                        for path in git_file_paths:
+                            self.writer.save_file(path)
 
-        self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
+        if self.rank == 0:
+            self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
 
     def log(self, locs: dict, width: int = 80, pad: int = 35):
-        self.tot_timesteps += self.num_steps_per_env * self.env.num_envs
+        self.tot_timesteps += self.num_steps_per_env * self.env.num_envs * self.world_size
         self.tot_time += locs["collection_time"] + locs["learn_time"]
         iteration_time = locs["collection_time"] + locs["learn_time"]
 
@@ -192,7 +207,7 @@ class OnPolicyRunner:
                     self.writer.add_scalar("Episode/" + key, value, locs["it"])
                     ep_string += f"""{f'Mean episode {key}:':>{pad}} {value:.4f}\n"""
         mean_std = self.alg.actor_critic.std.mean()
-        fps = int(self.num_steps_per_env * self.env.num_envs / (locs["collection_time"] + locs["learn_time"]))
+        fps = int(self.num_steps_per_env * self.env.num_envs * self.world_size / (locs["collection_time"] + locs["learn_time"]))
 
         self.writer.add_scalar("Loss/value_function", locs["mean_value_loss"], locs["it"])
         self.writer.add_scalar("Loss/surrogate", locs["mean_surrogate_loss"], locs["it"])

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.optim as optim
 
@@ -32,6 +33,9 @@ class PPO:
         device="cpu",
     ):
         self.device = device
+        self.distributed = distributed
+        if self.distributed:
+            self.world_size = int(os.getenv("WORLD_SIZE", "1"))
 
         self.desired_kl = desired_kl
         self.schedule = schedule
@@ -40,6 +44,8 @@ class PPO:
         # PPO components
         self.actor_critic = actor_critic
         self.actor_critic.to(self.device)
+        if self.distributed:
+            self.actor_critic.broadcast_parameters()
         self.storage = None  # initialized later
         self.optimizer = optim.Adam(self.actor_critic.parameters(), lr=learning_rate)
         self.transition = RolloutStorage.Transition()
@@ -144,6 +150,11 @@ class PPO:
                     elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
                         self.learning_rate = min(1e-2, self.learning_rate * 1.5)
 
+                    if self.distributed:
+                        lr = torch.tensor([self.learning_rate], device=self.device)
+                        torch.distributed.broadcast(lr, 0)
+                        self.learning_rate = lr.item()
+
                     for param_group in self.optimizer.param_groups:
                         param_group["lr"] = self.learning_rate
 
@@ -171,6 +182,22 @@ class PPO:
             # Gradient step
             self.optimizer.zero_grad()
             loss.backward()
+            # gradients all reduce based on https://github.com/entity-neural-network/incubator/pull/220
+            if self.distributed:
+                all_grads_list = []
+                for param in self.actor_critic.parameters():
+                    if param.grad is not None:
+                        all_grads_list.append(param.grad.view(-1))
+
+                all_grads = torch.cat(all_grads_list)
+                dist.all_reduce(all_grads, op=dist.ReduceOp.SUM)
+                offset = 0
+                for param in self.actor_critic.parameters():
+                    if param.grad is not None:
+                        param.grad.data.copy_(
+                            all_grads[offset : offset + param.numel()].view_as(param.grad.data) / self.world_size
+                        )
+                        offset += param.numel()
             nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
             self.optimizer.step()
 
