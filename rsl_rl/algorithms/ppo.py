@@ -47,7 +47,9 @@ class PPO:
         self.actor_critic = actor_critic
         self.actor_critic.to(self.device)
         if self.distributed:
-            self.actor_critic.broadcast_parameters()
+            model_params = [self.actor_critic.state_dict()]
+            dist.broadcast_object_list(model_params, 0)
+            self.actor_critic.load_state_dict(model_params[0])
         self.storage = None  # initialized later
         self.optimizer = optim.Adam(self.actor_critic.parameters(), lr=learning_rate)
         self.transition = RolloutStorage.Transition()
