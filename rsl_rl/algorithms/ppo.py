@@ -31,6 +31,7 @@ class PPO:
         schedule="fixed",
         desired_kl=0.01,
         device="cpu",
+        distributed=False
     ):
         self.device = device
         self.distributed = distributed
