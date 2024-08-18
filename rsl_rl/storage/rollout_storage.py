@@ -34,13 +34,23 @@ class RolloutStorage:
         self.actions_shape = actions_shape
 
         # Core
-        self.observations = torch.zeros(num_transitions_per_env, num_envs, *obs_shape, device=self.device)
-        if privileged_obs_shape[0] is not None:
-            self.privileged_observations = torch.zeros(
-                num_transitions_per_env, num_envs, *privileged_obs_shape, device=self.device
-            )
+        if isinstance(obs_shape, dict):
+            self.observations = dict()
+            for name, shape in obs_shape.items():
+                self.observations[name] = torch.zeros(num_transitions_per_env, num_envs, *shape, device=self.device)
         else:
-            self.privileged_observations = None
+            self.observations = torch.zeros(num_transitions_per_env, num_envs, *obs_shape, device=self.device)
+        if isinstance(privileged_obs_shape, dict):
+            self.privileged_observations = dict()
+            for name, shape in privileged_obs_shape.items():
+                self.privileged_observations[name] = torch.zeros(num_transitions_per_env, num_envs, *shape, device=self.device)
+        else:
+            if privileged_obs_shape[0] is not None:
+                self.privileged_observations = torch.zeros(
+                    num_transitions_per_env, num_envs, *privileged_obs_shape, device=self.device
+                )
+            else:
+                self.privileged_observations = None
         self.rewards = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
         self.actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
         self.dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device).byte()
@@ -65,9 +75,17 @@ class RolloutStorage:
     def add_transitions(self, transition: Transition):
         if self.step >= self.num_transitions_per_env:
             raise AssertionError("Rollout buffer overflow")
-        self.observations[self.step].copy_(transition.observations)
+        if isinstance(self.observations, dict):
+            for name, obs in self.observations.items():
+                self.observations[name][self.step].copy_(transition.observations[name])
+        else:
+            self.observations[self.step].copy_(transition.observations)
         if self.privileged_observations is not None:
-            self.privileged_observations[self.step].copy_(transition.critic_observations)
+            if isinstance(self.privileged_observations, dict):
+                for name, obs in self.privileged_observations.items():
+                    self.privileged_observations[name][self.step].copy_(transition.critic_observations[name])
+            else:
+                self.privileged_observations[self.step].copy_(transition.critic_observations)
         self.actions[self.step].copy_(transition.actions)
         self.rewards[self.step].copy_(transition.rewards.view(-1, 1))
         self.dones[self.step].copy_(transition.dones.view(-1, 1))
@@ -132,9 +150,19 @@ class RolloutStorage:
         mini_batch_size = batch_size // num_mini_batches
         indices = torch.randperm(num_mini_batches * mini_batch_size, requires_grad=False, device=self.device)
 
-        observations = self.observations.flatten(0, 1)
+        if isinstance(self.observations, dict):
+            observations = dict()
+            for name, obs in self.observations.items():
+                observations[name] = obs.flatten(0, 1)
+        else:
+            observations = self.observations.flatten(0, 1)
         if self.privileged_observations is not None:
-            critic_observations = self.privileged_observations.flatten(0, 1)
+            if isinstance(self.observations, dict):
+                critic_observations = dict()
+                for name, obs in self.privileged_observations.items():
+                    critic_observations[name] = obs.flatten(0, 1)
+            else:
+                critic_observations = self.privileged_observations.flatten(0, 1)
         else:
             critic_observations = observations
 
@@ -152,8 +180,19 @@ class RolloutStorage:
                 end = (i + 1) * mini_batch_size
                 batch_idx = indices[start:end]
 
-                obs_batch = observations[batch_idx]
-                critic_observations_batch = critic_observations[batch_idx]
+                if isinstance(observations, dict):
+                    obs_batch = dict()
+                    for name, obs in observations.items():
+                        obs_batch[name] = obs[batch_idx]
+                else:
+                    obs_batch = observations[batch_idx]
+                if isinstance(observations, dict):
+                    critic_observations_batch = dict()
+                    for name, obs in critic_observations.items():
+                        critic_observations_batch[name] = obs[batch_idx]
+                else:
+                    critic_observations_batch = critic_observations[batch_idx]
+
                 actions_batch = actions[batch_idx]
                 target_values_batch = values[batch_idx]
                 returns_batch = returns[batch_idx]
